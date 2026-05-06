@@ -25,21 +25,23 @@ JRONE_FILE = 'jronecross.csv'
 OEM_FILE = 'oemcross.csv'
 FLP_FILE = 'flp.csv'
 
-# Необязательный локальный файл для связки VIN/авто -> OEM/номера турбины.
-# Формат с ; и заголовками:
-# vin_prefix;make;model;year_from;year_to;engine;oem_numbers
-# WV1ZZZ2H;VOLKSWAGEN;AMAROK;2010;2016;2.0 TDI;03L253016T, 03L253056G, 5304-970-0128
-VIN_OEM_FILE = 'vin_oem.csv'
+# ---------- VIN + интернет-поиск ----------
+# Локальную VIN-базу отключаем: бот ищет возможные номера турбины/OEM только через интернет.
+# Поддерживаются Brave Search API или SerpAPI. Нужен хотя бы один ключ.
+BRAVE_SEARCH_API_KEY = os.environ.get('BRAVE_SEARCH_API_KEY')
+SERPAPI_API_KEY = os.environ.get('SERPAPI_API_KEY')
+SEARCH_PROVIDER = os.environ.get('SEARCH_PROVIDER', '').lower().strip()  # brave / serpapi / auto
+WEB_SEARCH_MAX_RESULTS = int(os.environ.get('WEB_SEARCH_MAX_RESULTS', '8'))
+WEB_SEARCH_TIMEOUT = int(os.environ.get('WEB_SEARCH_TIMEOUT', '15'))
 
-# Необязательный внешний API с данными по запчастям.
-# Ожидаемый ответ JSON:
-# {
-#   "oem_numbers": ["03L253016T", "03L253056G"],
-#   "turbo_numbers": ["5304-970-0128"],
-#   "notes": "optional text"
-# }
-VIN_PARTS_API_URL = os.environ.get('VIN_PARTS_API_URL')
-VIN_PARTS_API_KEY = os.environ.get('VIN_PARTS_API_KEY')
+# Необязательно, но очень желательно: LLM извлекает из поисковой выдачи только номера турбин/OEM.
+# Без OPENAI_API_KEY бот использует более грубый regex-фолбэк и будет менее точным.
+OPENAI_API_KEY = os.environ.get('OPENAI_API_KEY')
+OPENAI_MODEL = os.environ.get('OPENAI_MODEL', 'gpt-4.1-mini')
+OPENAI_TIMEOUT = int(os.environ.get('OPENAI_TIMEOUT', '30'))
+
+# Сколько найденных в интернете номеров проверять по локальной E&E базе.
+MAX_VIN_CANDIDATES_TO_SEARCH = 30
 
 # ---------- Очистка текста ----------
 def clean_text(s: str) -> str:
@@ -160,56 +162,12 @@ except Exception as e:
     print(f"❌ Ошибка загрузки {FLP_FILE}: {e}")
 print(f"✅ FLP-база: {len(flp_norm_to_art)} уникальных FLP-номеров, {len(art_norm_to_flp)} уникальных артикулов.")
 
-# ---------- Локальная VIN -> OEM база ----------
-vin_oem_rows = []
-try:
-    with open(VIN_OEM_FILE, mode='r', encoding='utf-8-sig') as file:
-        reader = csv.DictReader(file, delimiter=';')
-        for row in reader:
-            vin_prefix = clean_text(row.get('vin_prefix', '')).upper()
-            oem_numbers = clean_text(row.get('oem_numbers', ''))
-            if vin_prefix and oem_numbers:
-                vin_oem_rows.append({
-                    'vin_prefix': vin_prefix,
-                    'make': clean_text(row.get('make', '')).upper(),
-                    'model': clean_text(row.get('model', '')).upper(),
-                    'year_from': clean_text(row.get('year_from', '')),
-                    'year_to': clean_text(row.get('year_to', '')),
-                    'engine': clean_text(row.get('engine', '')).upper(),
-                    'oem_numbers': split_numbers(oem_numbers) if 'split_numbers' in globals() else []
-                })
-except FileNotFoundError:
-    print("ℹ️ vin_oem.csv не найден. VIN будет расшифровываться, но без локальной привязки к OEM-номерам.")
-except Exception as e:
-    print(f"❌ Ошибка загрузки {VIN_OEM_FILE}: {e}")
-
-# split_numbers нужен выше, поэтому если файл успел загрузиться до объявления функции — поправим ниже.
+# ---------- Вспомогательная разбивка номеров ----------
 def split_numbers(value: str) -> List[str]:
     raw = re.split(r'[,;|\s]+', value or '')
     return [clean_text(x) for x in raw if clean_text(x)]
 
-# Если vin_oem.csv был прочитан до объявления split_numbers, перечитаем корректно.
-if vin_oem_rows and not vin_oem_rows[0].get('oem_numbers'):
-    vin_oem_rows = []
-    try:
-        with open(VIN_OEM_FILE, mode='r', encoding='utf-8-sig') as file:
-            reader = csv.DictReader(file, delimiter=';')
-            for row in reader:
-                vin_prefix = clean_text(row.get('vin_prefix', '')).upper()
-                oem_numbers = clean_text(row.get('oem_numbers', ''))
-                if vin_prefix and oem_numbers:
-                    vin_oem_rows.append({
-                        'vin_prefix': vin_prefix,
-                        'make': clean_text(row.get('make', '')).upper(),
-                        'model': clean_text(row.get('model', '')).upper(),
-                        'year_from': clean_text(row.get('year_from', '')),
-                        'year_to': clean_text(row.get('year_to', '')),
-                        'engine': clean_text(row.get('engine', '')).upper(),
-                        'oem_numbers': split_numbers(oem_numbers),
-                    })
-    except Exception:
-        pass
-print(f"✅ VIN-OEM база: {len(vin_oem_rows)} правил.")
+print("ℹ️ Локальная VIN-база отключена. VIN-режим использует интернет-поиск.")
 
 # ---------- Поиск в базах ----------
 def partial_search_main(search_norm: str) -> Set[str]:
@@ -379,65 +337,299 @@ def decode_vin_nhtsa(vin: str) -> Tuple[Optional[dict], Optional[str]]:
     except Exception as e:
         return None, f'Ошибка VIN-декодера: {e}'
 
-def find_oem_numbers_for_vin_locally(vin: str, vehicle: dict) -> List[str]:
+def choose_search_provider() -> Optional[str]:
+    provider = SEARCH_PROVIDER
+    if provider in ('brave', 'serpapi'):
+        return provider
+    if BRAVE_SEARCH_API_KEY:
+        return 'brave'
+    if SERPAPI_API_KEY:
+        return 'serpapi'
+    return None
+
+def compact_vehicle_description(vehicle: dict) -> str:
+    bits = []
+    if vehicle.get('make'):
+        bits.append(vehicle['make'])
+    if vehicle.get('model'):
+        bits.append(vehicle['model'])
+    if vehicle.get('year'):
+        bits.append(vehicle['year'])
+    if vehicle.get('displacement_l'):
+        bits.append(vehicle['displacement_l'] + 'L')
+    if vehicle.get('engine_model'):
+        bits.append(vehicle['engine_model'])
+    if vehicle.get('fuel'):
+        bits.append(vehicle['fuel'])
+    return ' '.join(bits).strip()
+
+def build_vin_web_queries(vin: str, vehicle: dict) -> List[str]:
     vin = normalize_text(vin)
-    make = normalize_text(vehicle.get('make', ''))
-    model = normalize_text(vehicle.get('model', ''))
-    year_raw = vehicle.get('year', '')
+    vehicle_desc = compact_vehicle_description(vehicle)
+    prefix8 = vin[:8]
+    prefix6 = vin[:6]
+
+    queries = []
+    # Сначала ищем по VIN / префиксу: полезно для европейских VIN, где внешний декодер вернул мало данных.
+    queries.append(f'"{vin}" turbocharger turbo OEM')
+    queries.append(f'"{prefix8}" turbocharger turbo OEM')
+    queries.append(f'"{prefix8}" model turbocharger')
+
+    if vehicle_desc:
+        queries.append(f'{vehicle_desc} turbocharger OEM number')
+        queries.append(f'{vehicle_desc} turbo part number Garrett BorgWarner KKK IHI MHI')
+    else:
+        queries.append(f'{prefix6} {prefix8} turbocharger OEM number')
+
+    # Дедупликация с сохранением порядка
+    seen = set()
+    final = []
+    for q in queries:
+        q = clean_text(q)
+        if q and q.lower() not in seen:
+            seen.add(q.lower())
+            final.append(q)
+    return final[:5]
+
+def search_web(query: str) -> Tuple[List[dict], Optional[str]]:
+    provider = choose_search_provider()
+    if not provider:
+        return [], "Не задан ключ поискового API: BRAVE_SEARCH_API_KEY или SERPAPI_API_KEY."
+
     try:
-        year = int(year_raw)
-    except Exception:
-        year = None
+        if provider == 'brave':
+            url = 'https://api.search.brave.com/res/v1/web/search?' + urllib.parse.urlencode({
+                'q': query,
+                'count': min(max(WEB_SEARCH_MAX_RESULTS, 1), 20),
+                'search_lang': 'en',
+                'country': 'us',
+                'safesearch': 'moderate',
+            })
+            data = http_json_request(url, headers={
+                'Accept': 'application/json',
+                'X-Subscription-Token': BRAVE_SEARCH_API_KEY,
+            }, timeout=WEB_SEARCH_TIMEOUT)
+            items = (data.get('web') or {}).get('results') or []
+            return [
+                {
+                    'title': clean_text(i.get('title', '')),
+                    'url': clean_text(i.get('url', '')),
+                    'snippet': clean_text(i.get('description', '')),
+                }
+                for i in items
+                if i.get('url')
+            ], None
 
-    numbers = []
-    for row in vin_oem_rows:
-        if not vin.startswith(row['vin_prefix'].upper()):
-            continue
-        if row.get('make') and normalize_text(row['make']) not in make:
-            continue
-        if row.get('model') and normalize_text(row['model']) not in model:
-            continue
-        if year is not None:
-            try:
-                yf = int(row['year_from']) if row['year_from'] else None
-                yt = int(row['year_to']) if row['year_to'] else None
-                if yf and year < yf:
-                    continue
-                if yt and year > yt:
-                    continue
-            except Exception:
-                pass
-        numbers.extend(row.get('oem_numbers', []))
-    return sorted(set(numbers))
+        if provider == 'serpapi':
+            url = 'https://serpapi.com/search.json?' + urllib.parse.urlencode({
+                'engine': 'google',
+                'q': query,
+                'api_key': SERPAPI_API_KEY,
+                'num': min(max(WEB_SEARCH_MAX_RESULTS, 1), 10),
+                'hl': 'en',
+            })
+            data = http_json_request(url, timeout=WEB_SEARCH_TIMEOUT)
+            items = data.get('organic_results') or []
+            return [
+                {
+                    'title': clean_text(i.get('title', '')),
+                    'url': clean_text(i.get('link', '')),
+                    'snippet': clean_text(i.get('snippet', '')),
+                }
+                for i in items
+                if i.get('link')
+            ], None
+    except Exception as e:
+        return [], f'Ошибка интернет-поиска ({provider}): {e}'
 
-def fetch_turbo_numbers_from_parts_api(vin: str, vehicle: dict) -> Tuple[List[str], Optional[str]]:
-    if not VIN_PARTS_API_URL:
+    return [], 'Неизвестный SEARCH_PROVIDER.'
+
+def search_web_for_vin(vin: str, vehicle: dict) -> Tuple[List[dict], List[str], List[str]]:
+    queries = build_vin_web_queries(vin, vehicle)
+    all_results = []
+    errors = []
+    seen_urls = set()
+    for q in queries:
+        results, error = search_web(q)
+        if error:
+            errors.append(error)
+            # если нет ключа, нет смысла повторять остальные запросы
+            if 'Не задан ключ' in error:
+                break
+            continue
+        for r in results:
+            url = r.get('url')
+            if url and url not in seen_urls:
+                seen_urls.add(url)
+                r['query'] = q
+                all_results.append(r)
+    return all_results[:40], queries, errors
+
+def extract_response_text(data: dict) -> str:
+    # Responses API обычно возвращает output_text, но оставим совместимый разбор.
+    if isinstance(data.get('output_text'), str):
+        return data['output_text']
+    parts = []
+    for item in data.get('output', []) or []:
+        for content in item.get('content', []) or []:
+            if content.get('type') in ('output_text', 'text') and content.get('text'):
+                parts.append(content['text'])
+    return '\n'.join(parts).strip()
+
+def extract_turbo_numbers_with_openai(vin: str, vehicle: dict, results: List[dict]) -> Tuple[List[dict], Optional[str]]:
+    if not OPENAI_API_KEY:
         return [], None
-    headers = {}
-    if VIN_PARTS_API_KEY:
-        headers['Authorization'] = f'Bearer {VIN_PARTS_API_KEY}'
+    if not results:
+        return [], None
+
+    compact_results = []
+    for idx, r in enumerate(results[:25], start=1):
+        compact_results.append({
+            'id': idx,
+            'title': r.get('title', ''),
+            'url': r.get('url', ''),
+            'snippet': r.get('snippet', ''),
+        })
+
+    schema = {
+        'type': 'object',
+        'additionalProperties': False,
+        'properties': {
+            'vehicle_guess': {'type': 'string'},
+            'candidates': {
+                'type': 'array',
+                'items': {
+                    'type': 'object',
+                    'additionalProperties': False,
+                    'properties': {
+                        'number': {'type': 'string'},
+                        'kind': {'type': 'string', 'enum': ['Turbo P/N', 'OEM P/N', 'Vehicle OE No', 'CHRA P/N', 'Other']},
+                        'confidence': {'type': 'string', 'enum': ['low', 'medium', 'high']},
+                        'why': {'type': 'string'},
+                        'source_ids': {'type': 'array', 'items': {'type': 'integer'}},
+                    },
+                    'required': ['number', 'kind', 'confidence', 'why', 'source_ids'],
+                },
+            },
+            'warning': {'type': 'string'},
+        },
+        'required': ['vehicle_guess', 'candidates', 'warning'],
+    }
+
+    prompt = {
+        'vin': normalize_text(vin),
+        'decoded_vehicle': vehicle,
+        'search_results': compact_results,
+        'task': (
+            'Extract only turbocharger-related part numbers for this VIN/vehicle from the search results. '
+            'Return possible turbocharger numbers, OEM turbo numbers, vehicle OE turbo numbers, or CHRA numbers. '
+            'Do not include unrelated engine, filter, gasket, or random part numbers. '
+            'If evidence is weak, mark confidence low. Prefer numbers explicitly near words like turbocharger, turbo, BorgWarner, KKK, Garrett, IHI, MHI, CHRA, actuator. '
+            'This is for preliminary lookup only, not final fitment.'
+        )
+    }
+
+    payload = {
+        'model': OPENAI_MODEL,
+        'instructions': 'You are an automotive turbocharger parts extraction assistant. Output only valid JSON matching the schema.',
+        'input': json.dumps(prompt, ensure_ascii=False),
+        'text': {
+            'format': {
+                'type': 'json_schema',
+                'name': 'turbo_number_extraction',
+                'schema': schema,
+                'strict': True,
+            }
+        },
+        'temperature': 0,
+        'max_output_tokens': 1400,
+    }
+
     try:
         data = http_json_request(
-            VIN_PARTS_API_URL,
+            'https://api.openai.com/v1/responses',
             method='POST',
-            payload={'vin': normalize_text(vin), 'vehicle': vehicle, 'group': 'turbocharger'},
-            headers=headers,
-            timeout=20,
+            payload=payload,
+            headers={'Authorization': f'Bearer {OPENAI_API_KEY}'},
+            timeout=OPENAI_TIMEOUT,
         )
-        numbers = []
-        for key in ('oem_numbers', 'turbo_numbers', 'numbers'):
-            value = data.get(key, [])
-            if isinstance(value, str):
-                numbers.extend(split_numbers(value))
-            elif isinstance(value, list):
-                numbers.extend(str(x) for x in value if str(x).strip())
-        note = clean_text(data.get('notes', '') or data.get('note', ''))
-        return sorted(set(clean_text(n) for n in numbers if clean_text(n))), note or None
+        text = extract_response_text(data)
+        parsed = json.loads(text)
+        candidates = parsed.get('candidates') or []
+        cleaned = []
+        seen = set()
+        for c in candidates:
+            number = clean_text(c.get('number', '')).upper()
+            # Отсекаем VIN-подобные строки и слишком короткий мусор.
+            if not number or is_vin(number) or len(normalize(number)) < 5:
+                continue
+            key = normalize(number)
+            if key in seen:
+                continue
+            seen.add(key)
+            c['number'] = number
+            cleaned.append(c)
+        return cleaned[:MAX_VIN_CANDIDATES_TO_SEARCH], None
     except Exception as e:
-        return [], f'⚠️ Ошибка внешнего VIN-parts API: {e}'
+        return [], f'Ошибка LLM-анализа интернет-выдачи: {e}'
+
+def regex_extract_candidate_numbers(results: List[dict]) -> List[dict]:
+    """Грубый запасной вариант, если LLM не подключён. Лучше использовать только как подсказку."""
+    patterns = [
+        r'\b\d{4}[-\s]?(?:970|988|710|715|988|998)[-\s]?\d{4}\b',  # BorgWarner/KKK-like
+        r'\b\d{6}[-\s]?\d{4}\b',                                    # Garrett-like short form
+        r'\b[A-Z]\d{2}\s?\d{3}\s?\d{2}\s?\d{99}\b',                 # почти не сработает, оставлено без вреда
+        r'\b0[0-9A-Z]{2}\s?253\s?0[0-9A-Z]{2,4}\b',                 # VAG turbo OE-like: 03L253...
+        r'\b[0-9A-Z]{2,4}253[0-9A-Z]{2,6}\b',                        # VAG compact
+    ]
+    turbo_words = re.compile(r'\b(turbo|turbocharger|borgwarner|garrett|kkk|ihi|mhi|chra|actuator)\b', re.I)
+    out = []
+    seen = set()
+    for idx, r in enumerate(results, start=1):
+        text = ' '.join([r.get('title',''), r.get('snippet','')])
+        if not turbo_words.search(text):
+            continue
+        for pat in patterns:
+            for m in re.finditer(pat, text, re.I):
+                number = clean_text(m.group(0)).upper().replace(' ', '-')
+                key = normalize(number)
+                if len(key) < 5 or key in seen or is_vin(number):
+                    continue
+                seen.add(key)
+                out.append({
+                    'number': number,
+                    'kind': 'Other',
+                    'confidence': 'low',
+                    'why': 'Найдено regex-поиском рядом с turbo-словами; требуется проверка.',
+                    'source_ids': [idx],
+                })
+    return out[:MAX_VIN_CANDIDATES_TO_SEARCH]
+
+def candidates_to_numbers(candidates: List[dict]) -> List[str]:
+    nums = []
+    for c in candidates:
+        n = clean_text(c.get('number', ''))
+        if n:
+            nums.append(n)
+    return sorted(set(nums))
+
+def source_lines_for_candidates(candidates: List[dict], results: List[dict], limit: int = 5) -> List[str]:
+    ids = []
+    for c in candidates:
+        for sid in c.get('source_ids', []) or []:
+            if isinstance(sid, int) and sid not in ids:
+                ids.append(sid)
+    lines = []
+    for sid in ids[:limit]:
+        if 1 <= sid <= len(results):
+            r = results[sid - 1]
+            title = r.get('title') or r.get('url') or 'source'
+            url = r.get('url') or ''
+            lines.append(f"• {title[:70]} — {url}")
+    return lines
 
 async def handle_vin(update: Update, vin: str):
-    await update.message.reply_text("🔎 VIN распознан. Расшифровываю автомобиль и ищу возможные номера турбины…")
+    await update.message.reply_text("🔎 VIN распознан. Расшифровываю автомобиль и ищу возможные номера турбины в интернете…")
 
     vehicle, error = decode_vin_nhtsa(vin)
     if error or not vehicle:
@@ -450,7 +642,7 @@ async def handle_vin(update: Update, vin: str):
     vehicle_lines = [
         f"🔎 VIN: {vehicle['vin']}",
         "",
-        "🚗 Автомобиль:",
+        "🚗 Автомобиль по VIN-декодеру:",
         f"• Марка: {vehicle.get('make') or '—'}",
         f"• Модель: {vehicle.get('model') or '—'}",
         f"• Год: {vehicle.get('year') or '—'}",
@@ -467,40 +659,61 @@ async def handle_vin(update: Update, vin: str):
     if engine_bits:
         vehicle_lines.append(f"• Двигатель: {', '.join(engine_bits)}")
 
-    candidate_numbers = []
-    candidate_numbers.extend(find_oem_numbers_for_vin_locally(vehicle['vin'], vehicle))
-    api_numbers, api_note = fetch_turbo_numbers_from_parts_api(vehicle['vin'], vehicle)
-    candidate_numbers.extend(api_numbers)
-    candidate_numbers = sorted(set(candidate_numbers))[:MAX_VIN_CANDIDATES_TO_SEARCH]
+    web_results, queries, web_errors = search_web_for_vin(vehicle['vin'], vehicle)
+
+    if web_errors and not web_results:
+        vehicle_lines.extend([
+            "",
+            "⚠️ Интернет-поиск не выполнен.",
+            *[f"• {e}" for e in sorted(set(web_errors))],
+            "",
+            "Чтобы включить режим интернет-подсказки, задайте BRAVE_SEARCH_API_KEY или SERPAPI_API_KEY.",
+            "Для точного подбора пока пришлите фото шильдика турбины или номер турбины/OEM."
+        ])
+        await update.message.reply_text('\n'.join(vehicle_lines))
+        return
+
+    candidates, llm_error = extract_turbo_numbers_with_openai(vehicle['vin'], vehicle, web_results)
+    extraction_note = None
+    if not candidates:
+        candidates = regex_extract_candidate_numbers(web_results)
+        if candidates:
+            extraction_note = "⚠️ OPENAI_API_KEY не задан или LLM не вернул кандидатов. Номера извлечены грубым regex-поиском, уверенность низкая."
+
+    candidate_numbers = candidates_to_numbers(candidates)
 
     if not candidate_numbers:
         vehicle_lines.extend([
             "",
-            "⚠️ Автомобиль расшифрован, но номера турбины/OEM не найдены.",
-            "Чтобы VIN сразу давал E&E артикулы, нужно подключить внешний каталог запчастей через VIN_PARTS_API_URL или заполнить локальный vin_oem.csv.",
+            "🌐 Интернет-поиск выполнен, но надёжные номера турбины/OEM не извлечены.",
+            "",
+            "Поисковые запросы:",
+            *[f"• {q}" for q in queries[:5]],
+        ])
+        if llm_error:
+            vehicle_lines.extend(["", f"⚠️ {llm_error}"])
+        vehicle_lines.extend([
             "",
             "📌 Для точного подбора пришлите фото шильдика турбины или номер Garrett / BorgWarner / IHI / MHI / OEM."
         ])
-        if api_note:
-            vehicle_lines.append("")
-            vehicle_lines.append(api_note)
         await update.message.reply_text('\n'.join(vehicle_lines))
         return
 
-    vehicle_lines.append("")
-    vehicle_lines.append("🧾 Возможные номера турбины/OEM по VIN:")
-    vehicle_lines.extend(f"• {n}" for n in candidate_numbers[:15])
-    if len(candidate_numbers) > 15:
-        vehicle_lines.append(f"…и ещё {len(candidate_numbers) - 15}")
+    vehicle_lines.extend([
+        "",
+        "🌐 Возможные номера турбины/OEM, найденные через интернет:",
+    ])
+    for c in candidates[:15]:
+        vehicle_lines.append(f"• {c['number']} — {c.get('kind', 'номер')}, уверенность: {c.get('confidence', 'low')}")
+    if len(candidates) > 15:
+        vehicle_lines.append(f"…и ещё {len(candidates) - 15}")
 
-    # Ищем каждый найденный OEM/номер турбины в твоей E&E базе.
+    # Ищем найденные интернетом номера в твоей E&E базе.
     combined = {'main': set(), 'jrn': set(), 'oem': set(), 'flp_art': set(), 'flp_num': set()}
     matched_numbers = []
-    for num in candidate_numbers:
+    for num in candidate_numbers[:MAX_VIN_CANDIDATES_TO_SEARCH]:
         res = search_all_sources(num, partial=False)
         if total_found(res) == 0:
-            # иногда OEM в каталоге записан без дефисов/точек, partial=False уже ищет по нормализованному ключу;
-            # если ничего нет, не расширяем частично, чтобы VIN не выдавал мусор.
             continue
         matched_numbers.append(num)
         for key in combined:
@@ -509,23 +722,30 @@ async def handle_vin(update: Update, vin: str):
     if total_found(combined) == 0:
         vehicle_lines.extend([
             "",
-            "❌ Эти номера пока не дали совпадений в E&E базе.",
-            "📌 Для точного подбора всё равно лучше запросить фото шильдика турбины."
+            "❌ По найденным в интернете номерам совпадений в E&E базе пока нет.",
+            "📌 Проверьте номер по шильдику турбины или пришлите фото шильдика."
         ])
     else:
         vehicle_lines.extend([
             "",
             f"✅ Совпадения в E&E базе найдены по номерам: {', '.join(matched_numbers[:8])}{' ...' if len(matched_numbers) > 8 else ''}",
-        ])
-        vehicle_lines.append("")
-        vehicle_lines.append(format_search_result("VIN-кандидаты", combined, title="📦 Подходящие E&E артикулы:"))
-        vehicle_lines.extend([
             "",
-            "⚠️ VIN-подбор не должен быть финальным без проверки шильдика: на одной машине могут стоять разные турбины по году, рынку, мощности и замене." 
+            format_search_result("VIN-интернет-кандидаты", combined, title="📦 Подходящие E&E артикулы:"),
         ])
-    if api_note:
-        vehicle_lines.append("")
-        vehicle_lines.append(api_note)
+
+    source_lines = source_lines_for_candidates(candidates, web_results, limit=5)
+    if source_lines:
+        vehicle_lines.extend(["", "🔗 Источники интернет-подсказки:", *source_lines])
+
+    if extraction_note:
+        vehicle_lines.extend(["", extraction_note])
+    if llm_error:
+        vehicle_lines.extend(["", f"⚠️ {llm_error}"])
+
+    vehicle_lines.extend([
+        "",
+        "⚠️ Это предварительная интернет-подсказка, а не финальный подбор. Обязательно проверьте номер по шильдику турбины: на одной машине могут стоять разные турбины по году, рынку, мощности и замене."
+    ])
 
     await update.message.reply_text('\n'.join(vehicle_lines))
 
